@@ -7,6 +7,7 @@ import pgx.core
 import jax.numpy as jnp
 
 from flax.training.train_state import TrainState
+from tensorboardX import SummaryWriter
 
 from MCTX.mctx     import MCTX, SearchConfig
 from Scorch.scorch import Scorch
@@ -16,6 +17,7 @@ import functools
 
 from typing import TypeAlias, Tuple, Dict, cast
 from dataclasses import dataclass
+from datetime import datetime
 
 Observation  : TypeAlias = jax.Array
 PolicyTarget : TypeAlias = jax.Array
@@ -195,13 +197,13 @@ class SelfPlayCollector:
                 ).reshape(-1)[valid],
         )
 
-
 class ScorchTrainer:
     def __init__(
         self,
         scorch          : Scorch,
         env             : ScorchEnv,
-        training_config : TrainingConfig
+        training_config : TrainingConfig,
+        training_run    : str | None = None,
     ) -> None:
         self.scorch : Scorch         = scorch
         self.env    : ScorchEnv      = env
@@ -224,6 +226,7 @@ class ScorchTrainer:
             tx       = optimizer
         )
 
+        self.writer          : SummaryWriter     = SummaryWriter(f"runs/{training_run}_{datetime.now()}")
         self.collector       : SelfPlayCollector = SelfPlayCollector()
         self.next_episode_id : int = 0
 
@@ -317,7 +320,7 @@ class ScorchTrainer:
     def _update_one_batch(self, carry, minibatch : SelfPlayExamples) -> Tuple[TrainState, Dict[str, jax.Array]]:
         return self._train_step(carry, minibatch, self.config.value_loss_weight)
     
-    def _train_epoch(self, examples : SelfPlayExamples, key : jax.Array, batch_size : int) -> None:
+    def _train_epoch(self, examples : SelfPlayExamples, key : jax.Array, batch_size : int) -> Dict[str, jax.Array]:
         # 1. Shuffle examples
         shuffled_examples : SelfPlayExamples = self._shuffle_examples(examples, key)
 
@@ -333,11 +336,14 @@ class ScorchTrainer:
 
         self.scorch.params = self.train_state.params
 
+        return metrics
+
     def _train_iteration(
             self, 
             key         : jax.Array, 
             epochs      : int,
-            batch_size  : int, 
+            batch_size  : int,
+            iteration   : int   = 0,
             num_steps   : int   = 256,
             temperature : float = 1.0
         ) -> None:
@@ -355,10 +361,18 @@ class ScorchTrainer:
         if examples.episode_ids.shape[0] < batch_size:
             return
     
-        for _ in range(epochs):
+        for i in range(iteration * epochs, iteration * epochs + epochs):
             key, shuffle_key = jax.random.split(key)
 
-            self._train_epoch(examples, shuffle_key, batch_size)
+            metrics : Dict[str, jax.Array] = self._train_epoch(examples, shuffle_key, batch_size)
+
+            mean_metrics : Dict[str, jax.Array] = jax.tree_util.tree_map(
+                lambda x : jnp.mean(x),
+                metrics 
+            )
+
+            for name, value in mean_metrics.items():
+                self.writer.add_scalar(f'train/{name}', float(value), i)
 
     def train(
         self,
@@ -367,10 +381,10 @@ class ScorchTrainer:
         num_steps   : int   = 256,
         temperature : float = 1.0,
     ) -> jax.Array:
-        for _ in range(iterations):
+        for i in range(iterations):
             key, iter_key = jax.random.split(key)
 
-            self._train_iteration(iter_key, self.config.epochs, self.config.batch_size, num_steps, temperature)
+            self._train_iteration(iter_key, self.config.epochs, self.config.batch_size, i, num_steps, temperature)
 
         return key
         
