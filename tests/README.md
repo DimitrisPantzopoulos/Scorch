@@ -1,6 +1,6 @@
 # Tests
 
-From the project root, using a Python interpreter with `jax`, `flax`, `pgx`, `mctx`, `chex`, `optax`,
+From the project root, using a Python interpreter with `jax`, `flax`, `pgx`, `mctx`, `chex`, `optax`, `orbax-checkpoint`, `tensorboardX`, `tensorboard`,
 and `numpy` installed:
 
 ```powershell
@@ -56,4 +56,30 @@ Run these tests from the project root:
 
 ```powershell
 python -m unittest tests.test_training -v
+```
+
+TensorBoard logging tests read real event files to verify scalar names, values,
+minibatch averaging, iteration/epoch steps, self-play counts, timings, and
+logging when there are too few completed examples to train. Writers are closed
+before readback to drain asynchronous writes. Training fixtures redirect real
+writers to temporary folders and clean up their files automatically.
+
+Run the logging tests from the project root:
+
+```powershell
+python -m unittest tests.test_tensorboard_logging -v
+```
+
+Checkpoint tests save and restore real Orbax checkpoints in temporary folders.
+They verify model parameters, Adam optimizer state, training steps, episode
+counters, trainer/agent/environment random keys, fresh-trainer predictions,
+deterministic optimizer and action resumption, relative paths, zero-state
+checkpoints, missing paths, overwrite protection, and independent snapshots.
+The environment RNG is restored; reset the environment to reproduce the next
+game, since live board state is not part of the checkpoint payload.
+
+Run the checkpoint tests from the project root:
+
+```powershell
+python -m unittest tests.test_checkpoints -v
 ```

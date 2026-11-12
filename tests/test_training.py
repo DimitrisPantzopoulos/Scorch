@@ -7,6 +7,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from tests.tensorboard_utils import isolate_tensorboard_writers
+
 from Go.env import ScorchEnv
 from MCTX.mctx import SearchConfig
 from Scorch.scorch import Scorch
@@ -32,6 +34,7 @@ def trees_differ(left, right):
 class ScorchTrainerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.log_root = isolate_tensorboard_writers(cls)
         cls.env = ScorchEnv(batch_size=2, seed=21)
         cls.agent = Scorch(SearchConfig(num_simulations=1), cls.env, seed=123)
         cls.params = cls.agent.params
@@ -159,6 +162,7 @@ class ScorchTrainerTests(unittest.TestCase):
 class SelfPlayCollectorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.log_root = isolate_tensorboard_writers(cls)
         cls.env = ScorchEnv(batch_size=2, seed=91)
         cls.initial_state, cls.env_key = cls.env.state, cls.env.key
         cls.config = SearchConfig(
@@ -297,6 +301,7 @@ class SelfPlayCollectorTests(unittest.TestCase):
 class TrainingLoopTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.log_root = isolate_tensorboard_writers(cls)
         cls.env = ScorchEnv(batch_size=2, seed=91)
         cls.env_state, cls.env_key = cls.env.state, cls.env.key
         cls.agent = Scorch(

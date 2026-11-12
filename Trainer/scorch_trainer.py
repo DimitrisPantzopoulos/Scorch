@@ -1,10 +1,10 @@
 import chex
 import jax
-import flax
 import optax
 import pgx
 import pgx.core
 import jax.numpy as jnp
+import orbax.checkpoint as ocp
 
 from flax.training.train_state import TrainState
 from tensorboardX import SummaryWriter
@@ -14,10 +14,15 @@ from Scorch.scorch import Scorch
 from Go.env        import ScorchEnv
 
 import functools
+import time
 
-from typing import TypeAlias, Tuple, Dict, cast
-from dataclasses import dataclass
+from typing import Any, TypeAlias, Tuple, Dict, cast
+from dataclasses import dataclass, fields
 from datetime import datetime
+from pathlib import Path
+
+Metrics : TypeAlias = Dict[str, jax.Array | int | float]
+Record  : TypeAlias = Dict[str, jax.Array]
 
 Observation  : TypeAlias = jax.Array
 PolicyTarget : TypeAlias = jax.Array
@@ -42,6 +47,14 @@ class TrainingConfig:
 
     epochs            : int   = 256
     batch_size        : int   = 128
+
+@dataclass
+class Checkpoint:
+    state           : TrainState
+    next_episode_id : int
+    trainer_key     : jax.Array
+    scorch_key      : jax.Array
+    env_key         : jax.Array
 
 class SelfPlayCollector:
     @functools.partial(jax.jit, static_argnums=(0, 2, 6))
@@ -80,7 +93,7 @@ class SelfPlayCollector:
             temperature : float,
             config      : SearchConfig,
             _
-        ) -> Tuple[Tuple[pgx.core.State, jax.Array, jax.Array], Dict[str, jax.Array]]:
+        ) -> Tuple[Tuple[pgx.core.State, jax.Array, jax.Array], Record]:
         state, key, final_rewards = carry
 
         active : jax.Array = ~(state.terminated | state.truncated)
@@ -91,9 +104,9 @@ class SelfPlayCollector:
             tuple[pgx.core.State, jax.Array],
             jax.lax.cond(
                 active.any(),
-                lambda operand: self._play(params, mctx, state, temperature, search_key, config, operand),
-                lambda operand: self._skip(state, operand),
-                operand=None,
+                lambda operand : self._play(params, mctx, state, temperature, search_key, config, operand),
+                lambda operand : self._skip(state, operand),
+                operand = None,
             )
         )
 
@@ -105,7 +118,7 @@ class SelfPlayCollector:
             final_rewards
         )
 
-        record : Dict[str, jax.Array] = {
+        record : Record = {
             "observations"   : state.observation,
             "policy_targets" : policy_targets,
             "side_to_move"   : state.current_player,
@@ -122,7 +135,7 @@ class SelfPlayCollector:
             config      : SearchConfig,
             temperature : float,
             scan_input  : None
-        ) -> Tuple[Tuple[pgx.core.State, jax.Array, jax.Array], Dict[str, jax.Array]]:
+        ) -> Tuple[Tuple[pgx.core.State, jax.Array, jax.Array], Record]:
         return self._step(carry, params, mctx, temperature, config, scan_input)
     
     @functools.partial(jax.jit, static_argnames=('self', 'mctx', 'config', 'num_steps'))
@@ -135,7 +148,7 @@ class SelfPlayCollector:
             config      : SearchConfig,
             temperature : float = 1.0,
             num_steps   : int   = 256,
-        ) -> Tuple[Tuple[pgx.core.State, jax.Array, jax.Array], Dict[str, jax.Array]]:
+        ) -> Tuple[Tuple[pgx.core.State, jax.Array, jax.Array], Record]:
             initial_carry : Tuple[pgx.core.State, jax.Array, jax.Array] = (state, rng_key, jnp.zeros_like(state.rewards))
 
             final_carry, history = jax.lax.scan(
@@ -226,9 +239,81 @@ class ScorchTrainer:
             tx       = optimizer
         )
 
-        self.writer          : SummaryWriter     = SummaryWriter(f"runs/{training_run}_{datetime.now()}")
-        self.collector       : SelfPlayCollector = SelfPlayCollector()
-        self.next_episode_id : int = 0
+        self.writer              : SummaryWriter     = SummaryWriter(f"runs/{training_run}_{datetime.now():%Y%m%d_%H%M%S_%f}")
+        self.collector           : SelfPlayCollector = SelfPlayCollector()
+        self.next_episode_id     : int               = 0
+
+    def _make_scorch_checkpoint(self, key : jax.Array) -> Checkpoint:
+        return Checkpoint(
+            state           = self.train_state,
+            next_episode_id = self.next_episode_id,
+            trainer_key     = key,
+            scorch_key      = self.scorch.prng_key,
+            env_key         = self.env.key
+        )
+
+    def _save_checkpoint(self, path : str, key : jax.Array) -> None:
+        with ocp.StandardCheckpointer() as checkpointer:
+            abs_path : Path = Path(path).resolve()
+
+            scorch_checkpoint : Checkpoint = self._make_scorch_checkpoint(key)
+
+            scorch_tree : Dict[str, Any] = {
+                field.name : getattr(scorch_checkpoint, field.name)
+                for field in fields(scorch_checkpoint)
+            }
+
+            checkpointer.save(abs_path, scorch_tree)
+            checkpointer.wait_until_finished()
+
+    def load_checkpoint(self, path : str) -> jax.Array:
+        """Restore training state and return the trainer PRNG key."""
+        with ocp.StandardCheckpointer() as checkpointer:
+            # 1. Resolve the absolute path
+            abs_path : Path = Path(path).resolve()
+
+            # 2. Make Placeholder checkpoint which will be populate later
+            template : Checkpoint = self._make_scorch_checkpoint(jax.random.PRNGKey(0))
+
+            template_tree : Dict[str, Any] = {
+                field.name : getattr(template, field.name)
+                for field in fields(template)
+            }
+
+            # 3. Load the Checkpoint
+            loaded_checkpoint : Checkpoint = Checkpoint(
+                **(checkpointer.restore(abs_path, target=template_tree))
+            )
+
+            # 4. Assign all the variables back
+            self.train_state     = loaded_checkpoint.state
+            self.next_episode_id = loaded_checkpoint.next_episode_id
+            trainer_key          = loaded_checkpoint.trainer_key
+            self.scorch.prng_key = loaded_checkpoint.scorch_key
+            self.env.key         = loaded_checkpoint.env_key
+
+            self.scorch.params = self.train_state.params
+
+        return trainer_key
+
+
+    def _log_metrics(self, metrics : Metrics, timestep : int, prefix : str) -> None:
+        mean_metrics : Metrics = jax.tree_util.tree_map(
+            lambda x : jnp.mean(x),
+            metrics
+        )
+
+        for name, value in mean_metrics.items():
+            self.writer.add_scalar(f'{prefix}/{name}', float(value), timestep)
+
+    def _calculate_self_play_metrics(self, examples : SelfPlayExamples, time_delta) -> Metrics:
+        self_play_metrics : Metrics = {
+            "positions"      : int(examples.episode_ids.shape[0]),
+            "games_finished" : int(jnp.unique(examples.episode_ids).shape[0]),
+            "time_delta"     : float(time_delta)
+        }
+
+        return self_play_metrics
 
     @functools.partial(jax.jit, static_argnums=(0, ))
     def _train_step(
@@ -236,8 +321,8 @@ class ScorchTrainer:
         train_state        : TrainState,
         self_play_examples : SelfPlayExamples,
         value_loss_weight  : float
-    ) -> Tuple[TrainState, Dict[str, jax.Array]]:
-        def _loss_fn(params) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+    ) -> Tuple[TrainState, Metrics]:
+        def _loss_fn(params) -> Tuple[jax.Array, Metrics]:
             policy_logits, predicted_values = cast(
                 tuple[jax.Array, jax.Array],
                 train_state.apply_fn(
@@ -258,23 +343,23 @@ class ScorchTrainer:
 
             total_loss : jax.Array = policy_loss + value_loss * value_loss_weight
 
-            metrics : Dict[str, jax.Array] = {
+            loss_metrics : Metrics = {
                 "loss"        : total_loss,
                 "policy_loss" : policy_loss,
                 "value_loss"  : value_loss,
             }
 
-            return total_loss, metrics
+            return total_loss, loss_metrics
 
         # Compute gradients of the loss with respect to the parameters.
-        (_, metrics), gradients =  jax.value_and_grad(
+        (_, loss_metrics), gradients =  jax.value_and_grad(
             _loss_fn,
             has_aux  = True
         )(train_state.params)
 
         updated_train_state : TrainState = train_state.apply_gradients(grads=gradients)
 
-        return updated_train_state, metrics        
+        return updated_train_state, loss_metrics
 
     def _shuffle_examples(self, examples : SelfPlayExamples, key : jax.Array) -> SelfPlayExamples:
         indices : jax.Array = jnp.arange(examples.episode_ids.shape[0])
@@ -305,7 +390,7 @@ class ScorchTrainer:
     def _train_batch(
             self,
             self_play_examples : SelfPlayExamples,
-        ) -> Dict[str, jax.Array]:
+        ) -> Metrics:
         self.train_state, metrics = self._train_step(
             self.train_state,
             self_play_examples,
@@ -317,10 +402,10 @@ class ScorchTrainer:
 
         return metrics
 
-    def _update_one_batch(self, carry, minibatch : SelfPlayExamples) -> Tuple[TrainState, Dict[str, jax.Array]]:
+    def _update_one_batch(self, carry, minibatch : SelfPlayExamples) -> Tuple[TrainState, Metrics]:
         return self._train_step(carry, minibatch, self.config.value_loss_weight)
     
-    def _train_epoch(self, examples : SelfPlayExamples, key : jax.Array, batch_size : int) -> Dict[str, jax.Array]:
+    def _train_epoch(self, examples : SelfPlayExamples, key : jax.Array, batch_size : int) -> Metrics:
         # 1. Shuffle examples
         shuffled_examples : SelfPlayExamples = self._shuffle_examples(examples, key)
 
@@ -348,13 +433,22 @@ class ScorchTrainer:
             temperature : float = 1.0
         ) -> None:
 
-        examples : SelfPlayExamples = self.collector.collect_self_play_games(
+        start_time : float = time.perf_counter()
+
+        examples : SelfPlayExamples = jax.block_until_ready(self.collector.collect_self_play_games(
             scorch           = self.scorch,
             env              = self.env,
             start_episode_id = self.next_episode_id,
             temperature      = temperature,
             num_steps        = num_steps,
-        )
+        ))
+
+        end_time : float = time.perf_counter()
+
+        # Calculate and log self play metrics
+        self_play_metrics : Metrics = self._calculate_self_play_metrics(examples, end_time - start_time)
+
+        self._log_metrics(self_play_metrics, iteration, prefix='self_play')
 
         self.next_episode_id += self.env.batch_size
 
@@ -364,15 +458,9 @@ class ScorchTrainer:
         for i in range(iteration * epochs, iteration * epochs + epochs):
             key, shuffle_key = jax.random.split(key)
 
-            metrics : Dict[str, jax.Array] = self._train_epoch(examples, shuffle_key, batch_size)
+            loss_metrics : Metrics = self._train_epoch(examples, shuffle_key, batch_size)
 
-            mean_metrics : Dict[str, jax.Array] = jax.tree_util.tree_map(
-                lambda x : jnp.mean(x),
-                metrics 
-            )
-
-            for name, value in mean_metrics.items():
-                self.writer.add_scalar(f'train/{name}', float(value), i)
+            self._log_metrics(loss_metrics, i, prefix='train')
 
     def train(
         self,
