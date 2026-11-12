@@ -44,6 +44,7 @@ class TensorBoardLoggingTests(unittest.TestCase):
         self.agent.params, self.agent.prng_key = self.params, self.agent_key
         self.trainer.train_state = self.initial_train_state
         self.trainer.next_episode_id = 0
+        self.trainer.next_iteration = 0
         self.trainer.writer.close()
         self.trainer.writer = trainer_module.SummaryWriter(
             str(self.log_root / self._testMethodName)
@@ -135,7 +136,7 @@ class TensorBoardLoggingTests(unittest.TestCase):
 
     def test_real_training_logs_each_iteration_and_epoch_with_correct_steps(self):
         with self.clock(10.0, 12.5, 20.0, 23.75):
-            self.trainer.train(jax.random.PRNGKey(7), iterations=2,
+            self.trainer.train(jax.random.PRNGKey(7), evaluation_config=None, iterations=2,
                                num_steps=4, temperature=0.0)
         events = self.events()
         self.assertEqual(set(events), {
@@ -169,7 +170,7 @@ class TensorBoardLoggingTests(unittest.TestCase):
 
     def test_unfinished_games_log_zero_counts_without_training_loss(self):
         with self.clock(1.0, 1.5):
-            self.trainer.train(jax.random.PRNGKey(7), iterations=1,
+            self.trainer.train(jax.random.PRNGKey(7), evaluation_config=None, iterations=1,
                                num_steps=1, temperature=0.0)
         self.assertEqual(self.events(), {
             "self_play/positions": [(0, 0.0)],

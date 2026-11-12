@@ -8,6 +8,7 @@ import orbax.checkpoint as ocp
 
 from flax.training.train_state import TrainState
 from tensorboardX import SummaryWriter
+from torch import float32
 
 from MCTX.mctx     import MCTX, SearchConfig
 from Scorch.scorch import Scorch
@@ -15,9 +16,10 @@ from Go.env        import ScorchEnv
 
 import functools
 import time
+import math
 
 from typing import Any, TypeAlias, Tuple, Dict, cast
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -48,13 +50,59 @@ class TrainingConfig:
     epochs            : int   = 256
     batch_size        : int   = 128
 
-@dataclass
+@dataclass(frozen=True)
+class EvaluationConfig:
+    batch_size    : int = 32
+    num_steps     : int = 256
+    seed          : int = 42
+    search_config : SearchConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.batch_size < 2 or self.batch_size % 2:
+            raise ValueError("Evaluation batch_size must be positive and even.")
+        if self.num_steps < 1:
+            raise ValueError("Evaluation num_steps must be positive.")
+
+@dataclass(slots=True)
 class Checkpoint:
     state           : TrainState
     next_episode_id : int
     trainer_key     : jax.Array
     scorch_key      : jax.Array
     env_key         : jax.Array
+    next_iteration  : int = 0
+
+@dataclass(slots=True)
+class Evaluation:
+    wins       : int
+    losses     : int
+    draws      : int
+    unfinished : int
+
+    @property
+    def completed_games(self) -> int:
+        return self.wins + self.draws + self.losses
+
+    @property
+    def score_rate(self) -> float | None:
+        if self.completed_games == 0:
+            return None
+
+        return (self.wins + 0.5 * self.draws) / (self.completed_games)
+
+    @property
+    def elo_delta(self) -> float | None:
+        s : float | None = self.score_rate
+
+        if s is None:
+            return None
+        if s == 0.0:
+            return -math.inf
+        if s == 1.0:
+            return math.inf
+
+
+        return 400 * math.log10(s / (1 - s))
 
 class SelfPlayCollector:
     @functools.partial(jax.jit, static_argnums=(0, 2, 6))
@@ -139,7 +187,7 @@ class SelfPlayCollector:
         return self._step(carry, params, mctx, temperature, config, scan_input)
     
     @functools.partial(jax.jit, static_argnames=('self', 'mctx', 'config', 'num_steps'))
-    def _rollout(
+    def rollout(
             self,
             params,
             mctx        : MCTX,
@@ -172,7 +220,7 @@ class SelfPlayCollector:
 
         scorch.prng_key, rollout_key = jax.random.split(scorch.prng_key)
 
-        final_carry, history = self._rollout(
+        final_carry, history = self.rollout(
             params      = scorch.params,
             mctx        = scorch.mctx,
             state       = env.state,
@@ -210,6 +258,180 @@ class SelfPlayCollector:
                 ).reshape(-1)[valid],
         )
 
+class ScorchEvaluator:
+    def _step(
+        self,
+        carry,
+        candidate_params,
+        opponent_params,
+        mctx              : MCTX,
+        search_config     : SearchConfig,
+        temperature       : float,
+        candidate_player  : int,
+        _,
+    ):
+        state, key, final_rewards = carry
+
+        key, step_key = jax.random.split(key)
+
+        active : jax.Array = ~(state.terminated | state.truncated)
+
+        def play(_):
+            candidate_turn = state.current_player == candidate_player
+
+            def moves(params):
+                _, policy_targets = mctx._run_mctx(
+                    params, state, step_key, search_config, temperature
+                )
+                return jnp.argmax(policy_targets, axis=1)
+
+            def mixed_moves(_):
+                candidate_moves = moves(candidate_params)
+                opponent_moves = moves(opponent_params)
+                return jnp.where(candidate_turn, candidate_moves, opponent_moves)
+
+            # Player IDs are randomized independently by PGX. A batch can
+            # therefore contain turns belonging to both networks at once.
+            actions = jax.lax.cond(
+                jnp.all(~active | candidate_turn),
+                lambda _: moves(candidate_params),
+                lambda _: jax.lax.cond(
+                    jnp.all(~active | ~candidate_turn),
+                    lambda _: moves(opponent_params), mixed_moves, operand=None,
+                ),
+                operand=None,
+            )
+            return mctx.step_fn(state, actions)
+
+        def skip(_):
+            return state
+
+        next_state : pgx.core.State = jax.lax.cond(
+            active.any(),
+            play,
+            skip,
+            operand=None
+        )
+
+        newly_finished : jax.Array = active & next_state.terminated
+
+        final_rewards = jnp.where(
+            newly_finished[:, None],
+            next_state.rewards,
+            final_rewards
+        )
+
+        return (next_state, key, final_rewards), None
+
+    @functools.partial(jax.jit, static_argnames=(
+        'self', 'mctx', 'search_config', 'candidate_player', 'num_steps',
+    ))
+    def _evaluate_colour(
+        self,
+        candidate_params,
+        opponent_params,
+        mctx             : MCTX,
+        state            : pgx.core.State,
+        key              : jax.Array,
+        search_config    : SearchConfig,
+        temperature      : float,
+        candidate_player : int,
+        num_steps        : int
+    ) -> Dict[str, jax.Array]:
+        final_rewards : jax.Array = jnp.zeros_like(state.rewards)
+
+        initial_carry = (state, key, final_rewards)
+
+        final_carry, _ = jax.lax.scan(
+            lambda carry, _ : self._step(carry, candidate_params, opponent_params, mctx, search_config, temperature, candidate_player, _),
+            initial_carry,
+            xs     = None,
+            length = num_steps
+        )
+
+        final_state, _, final_rewards = final_carry
+
+        candidate_rewards : jax.Array = final_rewards[:, candidate_player]
+
+        wins : jax.Array = jnp.sum(
+            final_state.terminated & (candidate_rewards > 0)
+        )
+
+        losses : jax.Array = jnp.sum(
+            final_state.terminated & (candidate_rewards < 0)
+        )
+
+        draws : jax.Array = jnp.sum(
+            final_state.terminated & (candidate_rewards == 0)
+        )
+
+        unfinished : jax.Array = jnp.sum(
+            ~final_state.terminated
+        )
+
+        return {
+            "wins"       : wins,
+            "losses"     : losses,
+            "draws"      : draws,
+            "unfinished" : unfinished,
+        }
+
+    def evaluate(
+            self,
+            candidate_params,
+            opponent_params,
+            mctx             : MCTX,
+            key              : jax.Array,
+            search_config    : SearchConfig,
+            temperature      : float,
+            num_steps        : int,
+            batch_size       : int,
+            seed             : int
+        ) -> Evaluation:
+        if batch_size < 2 or batch_size % 2 != 0:
+            raise ValueError("batch_size must be positive and even.")
+        if num_steps < 0:
+            raise ValueError("num_steps must be nonnegative.")
+
+        scorch_env : ScorchEnv = ScorchEnv(batch_size // 2, seed)
+
+        state_1 : pgx.core.State = scorch_env.state
+        key, key_1 = jax.random.split(key)
+
+        state_2 : pgx.core.State = scorch_env.state
+        key, key_2 = jax.random.split(key)
+
+        env_1_evaluation : Dict[str, jax.Array] = self._evaluate_colour(
+            candidate_params,
+            opponent_params,
+            mctx,
+            state_1,
+            key_1,
+            search_config,
+            temperature,
+            0,
+            num_steps
+        )
+
+        env_2_evaluation : Dict[str, jax.Array] = self._evaluate_colour(
+            candidate_params,
+            opponent_params,
+            mctx,
+            state_2,
+            key_2,
+            search_config,
+            temperature,
+            1,
+            num_steps
+        )
+
+        return Evaluation(
+            wins       = env_1_evaluation['wins'].item() + env_2_evaluation['wins'].item(),
+            losses     = env_1_evaluation['losses'].item() + env_2_evaluation['losses'].item(),
+            draws      = env_1_evaluation['draws'].item() + env_2_evaluation['draws'].item(),
+            unfinished = env_1_evaluation['unfinished'].item() + env_2_evaluation['unfinished'].item()
+        )
+
 class ScorchTrainer:
     def __init__(
         self,
@@ -241,7 +463,9 @@ class ScorchTrainer:
 
         self.writer              : SummaryWriter     = SummaryWriter(f"runs/{training_run}_{datetime.now():%Y%m%d_%H%M%S_%f}")
         self.collector           : SelfPlayCollector = SelfPlayCollector()
+        self.evaluator           : ScorchEvaluator   = ScorchEvaluator()
         self.next_episode_id     : int               = 0
+        self.next_iteration      : int               = 0
 
     def _make_scorch_checkpoint(self, key : jax.Array) -> Checkpoint:
         return Checkpoint(
@@ -249,7 +473,8 @@ class ScorchTrainer:
             next_episode_id = self.next_episode_id,
             trainer_key     = key,
             scorch_key      = self.scorch.prng_key,
-            env_key         = self.env.key
+            env_key         = self.env.key,
+            next_iteration  = self.next_iteration,
         )
 
     def _save_checkpoint(self, path : str, key : jax.Array) -> None:
@@ -281,13 +506,24 @@ class ScorchTrainer:
             }
 
             # 3. Load the Checkpoint
-            loaded_checkpoint : Checkpoint = Checkpoint(
-                **(checkpointer.restore(abs_path, target=template_tree))
-            )
+            if not abs_path.exists():
+                raise FileNotFoundError(abs_path)
+            metadata = checkpointer.metadata(abs_path).item_metadata
+            if metadata is None:
+                raise ValueError("Checkpoint metadata is missing.")
+            if "next_iteration" not in metadata.tree:
+                # Previous checkpoints stored only episode IDs. Their fixed
+                # batch collector allocated one batch of IDs per iteration.
+                template_tree.pop("next_iteration")
+            restored = checkpointer.restore(abs_path, target=template_tree)
+            if "next_iteration" not in restored:
+                restored["next_iteration"] = int(restored["next_episode_id"]) // self.env.batch_size
+            loaded_checkpoint : Checkpoint = Checkpoint(**restored)
 
             # 4. Assign all the variables back
             self.train_state     = loaded_checkpoint.state
             self.next_episode_id = loaded_checkpoint.next_episode_id
+            self.next_iteration  = loaded_checkpoint.next_iteration
             trainer_key          = loaded_checkpoint.trainer_key
             self.scorch.prng_key = loaded_checkpoint.scorch_key
             self.env.key         = loaded_checkpoint.env_key
@@ -295,7 +531,6 @@ class ScorchTrainer:
             self.scorch.params = self.train_state.params
 
         return trainer_key
-
 
     def _log_metrics(self, metrics : Metrics, timestep : int, prefix : str) -> None:
         mean_metrics : Metrics = jax.tree_util.tree_map(
@@ -305,6 +540,22 @@ class ScorchTrainer:
 
         for name, value in mean_metrics.items():
             self.writer.add_scalar(f'{prefix}/{name}', float(value), timestep)
+
+    def _log_evaluation(self, result : Evaluation, iteration : int, promoted : bool) -> None:
+        metrics : Metrics = {
+            "wins": result.wins,
+            "losses": result.losses,
+            "draws": result.draws,
+            "unfinished": result.unfinished,
+            "completed_games": result.completed_games,
+            "promoted": int(promoted),
+        }
+        if result.score_rate is not None:
+            metrics["score_rate"] = result.score_rate
+        elo = result.elo_delta
+        if elo is not None and math.isfinite(elo):
+            metrics["elo_delta"] = elo
+        self._log_metrics(metrics, iteration, prefix="evaluation")
 
     def _calculate_self_play_metrics(self, examples : SelfPlayExamples, time_delta) -> Metrics:
         self_play_metrics : Metrics = {
@@ -463,16 +714,100 @@ class ScorchTrainer:
             self._log_metrics(loss_metrics, i, prefix='train')
 
     def train(
-        self,
-        key         : jax.Array,
-        iterations  : int,
-        num_steps   : int   = 256,
-        temperature : float = 1.0,
-    ) -> jax.Array:
-        for i in range(iterations):
+            self,
+            key               : jax.Array,
+            iterations        : int,
+            num_steps         : int                     = 256,
+            temperature       : float                   = 1.0,
+            *,
+            evaluation_config : EvaluationConfig | None = EvaluationConfig(),
+            checkpoint_dir    : str | Path | None        = None,
+        ) -> jax.Array:
+        if iterations < 0:
+            raise ValueError("iterations must be nonnegative.")
+
+        for _ in range(iterations):
+            iteration : int        = int(self.next_iteration)
+            incumbent : TrainState = self.train_state
+
+            iter_key : jax.Array
             key, iter_key = jax.random.split(key)
 
-            self._train_iteration(iter_key, self.config.epochs, self.config.batch_size, i, num_steps, temperature)
+            promoted : bool = False
+
+            try:
+                self._train_iteration(
+                    iter_key,
+                    self.config.epochs,
+                    self.config.batch_size,
+                    iteration,
+                    num_steps,
+                    temperature,
+                )
+
+                if (
+                    evaluation_config is not None
+                    and int(self.train_state.step) > int(incumbent.step)
+                ):
+                    eval_key : jax.Array
+                    key, eval_key = jax.random.split(key)
+
+                    search_config : SearchConfig | None = evaluation_config.search_config
+
+                    if search_config is None:
+                        search_config = replace(
+                            self.scorch.search_config,
+                            dirichlet_fraction = 0.0,
+                        )
+
+                    result : Evaluation = self.evaluator.evaluate(
+                        candidate_params = self.train_state.params,
+                        opponent_params  = incumbent.params,
+                        mctx             = self.scorch.mctx,
+                        key              = eval_key,
+                        search_config    = search_config,
+                        temperature      = 0.0,
+                        num_steps        = evaluation_config.num_steps,
+                        batch_size       = evaluation_config.batch_size,
+                        seed             = evaluation_config.seed,
+                    )
+
+                    score    : float | None = result.score_rate
+                    decision : bool         = (
+                        result.unfinished == 0
+                        and score is not None
+                        and score > 0.5
+                    )
+
+                    self._log_evaluation(
+                        result,
+                        iteration,
+                        decision,
+                    )
+
+                    promoted = decision
+
+            finally:
+                if evaluation_config is not None and not promoted:
+                    self.train_state   = incumbent
+                    self.scorch.params = incumbent.params
+
+            self.next_iteration = iteration + 1
+
+            if checkpoint_dir is not None:
+                directory : Path = Path(checkpoint_dir).resolve()
+
+                directory.mkdir(
+                    parents  = True,
+                    exist_ok = True,
+                )
+
+                self._save_checkpoint(
+                    str(directory / f"iteration_{iteration + 1:06d}"),
+                    key,
+                )
+
+            self.writer.flush()
 
         return key
         

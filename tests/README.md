@@ -83,3 +83,41 @@ Run the checkpoint tests from the project root:
 ```powershell
 python -m unittest tests.test_checkpoints -v
 ```
+
+The final training loop trains a candidate and evaluates it against the last
+accepted model after each iteration that produced optimizer updates. Promotion
+requires every evaluation game to finish and a score strictly above 50% (draws
+count as half a win). Rejection or evaluation failure restores both parameters
+and optimizer state while preserving consumed self-play randomness and episode
+IDs. Evaluation uses both player assignments and no Dirichlet noise by default.
+
+```python
+from Trainer.scorch_trainer import EvaluationConfig
+
+try:
+    key = trainer.train(
+        key,
+        iterations=100,
+        evaluation_config=EvaluationConfig(batch_size=32, num_steps=256),
+        checkpoint_dir="checkpoints/run",
+    )
+finally:
+    trainer.writer.close()
+```
+
+TensorBoard tags under `evaluation/` include wins, losses, draws, unfinished
+and completed games, promotion, score rate, and finite Elo delta. Undefined
+scores and infinite Elo values are omitted. The checkpointed iteration counter
+keeps logging steps and checkpoint names continuous across resumed runs.
+Checkpoint folders are named `iteration_000001`, `iteration_000002`, etc.;
+existing snapshots are never overwritten. Legacy checkpoints remain loadable.
+Pass `evaluation_config=None` explicitly for training without evaluation/gating.
+
+Evaluator and final-loop tests cover mixed player IDs in batches, balanced
+colours, candidate promotion/rejection, full optimizer rollback, incomplete
+matches, error handling, continued iteration counters, legacy checkpoints,
+real event files, and a complete self-play/training/evaluation cycle.
+
+```powershell
+python -m unittest tests.test_evaluator tests.test_final_training -v
+```

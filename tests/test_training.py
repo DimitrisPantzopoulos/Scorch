@@ -184,7 +184,7 @@ class SelfPlayCollectorTests(unittest.TestCase):
         self.agent.prng_key = self.agent_key
 
     def rollout(self, state=None, num_steps=4):
-        return self.collector._rollout(
+        return self.collector.rollout(
             params=self.params, mctx=self.agent.mctx,
             state=self.env.state if state is None else state,
             rng_key=jax.random.PRNGKey(456), config=self.config,
@@ -328,6 +328,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.agent.params, self.agent.prng_key = self.params, self.agent_key
         self.trainer.train_state = self.initial_train_state
         self.trainer.next_episode_id = 0
+        self.trainer.next_iteration = 0
 
     @staticmethod
     def indexed_examples(count):
@@ -451,7 +452,7 @@ class TrainingLoopTests(unittest.TestCase):
 
     def test_zero_iterations_preserve_keys_state_and_episode_counter(self):
         key = jax.random.PRNGKey(7)
-        returned = self.trainer.train(key, iterations=0, num_steps=4, temperature=0.0)
+        returned = self.trainer.train(key, evaluation_config=None, iterations=0, num_steps=4, temperature=0.0)
         np.testing.assert_array_equal(returned, key)
         np.testing.assert_array_equal(self.agent.prng_key, self.agent_key)
         np.testing.assert_array_equal(self.env.key, self.env_key)
@@ -461,7 +462,7 @@ class TrainingLoopTests(unittest.TestCase):
 
     def test_train_uses_configured_epochs_batch_size_and_fresh_iteration_keys(self):
         key = jax.random.PRNGKey(7)
-        returned = self.trainer.train(key, iterations=2, num_steps=4, temperature=0.0)
+        returned = self.trainer.train(key, evaluation_config=None, iterations=2, num_steps=4, temperature=0.0)
         self.assertEqual(int(self.trainer.train_state.step), 8)
         self.assertEqual(self.trainer.next_episode_id, 4)
         expected_key, _ = jax.random.split(key)
@@ -475,7 +476,7 @@ class TrainingLoopTests(unittest.TestCase):
 
     def test_unfinished_self_play_skips_training_without_nan_updates(self):
         key = jax.random.PRNGKey(7)
-        returned = self.trainer.train(key, iterations=1, num_steps=1, temperature=0.0)
+        returned = self.trainer.train(key, evaluation_config=None, iterations=1, num_steps=1, temperature=0.0)
         assert_tree_equal(self, self.trainer.train_state, self.initial_train_state)
         assert_tree_equal(self, self.agent.params, self.params)
         self.assertEqual(self.trainer.next_episode_id, 2)
@@ -483,12 +484,12 @@ class TrainingLoopTests(unittest.TestCase):
 
     def test_returned_key_allows_training_to_resume_reproducibly(self):
         key = jax.random.PRNGKey(7)
-        next_key = self.trainer.train(key, iterations=1, num_steps=4, temperature=0.0)
-        resumed_key = self.trainer.train(next_key, iterations=1, num_steps=4, temperature=0.0)
+        next_key = self.trainer.train(key, evaluation_config=None, iterations=1, num_steps=4, temperature=0.0)
+        resumed_key = self.trainer.train(next_key, evaluation_config=None, iterations=1, num_steps=4, temperature=0.0)
         resumed_state = self.trainer.train_state
         resumed_agent_key = self.agent.prng_key
         self.reset_training()
-        combined_key = self.trainer.train(key, iterations=2, num_steps=4, temperature=0.0)
+        combined_key = self.trainer.train(key, evaluation_config=None, iterations=2, num_steps=4, temperature=0.0)
         np.testing.assert_array_equal(resumed_key, combined_key)
         np.testing.assert_array_equal(resumed_agent_key, self.agent.prng_key)
         assert_tree_equal(self, self.trainer.train_state, resumed_state)
