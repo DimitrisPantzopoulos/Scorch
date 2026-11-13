@@ -2,6 +2,7 @@
 from pathlib import Path
 from types import TracebackType
 from typing import Self, Tuple
+from tqdm import tqdm
 import time
 
 import jax
@@ -232,7 +233,7 @@ class ScorchTrainer:
         last_evaluation : Evaluation | None = None
         checkpoint_path : Path | None = None
 
-        for _ in range(iterations):
+        for _ in tqdm(range(iterations), desc='Training', unit='iteration'):
             promoted, result = self._run_iteration()
             promotions += int(promoted)
             if result is not None:

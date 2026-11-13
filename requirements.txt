@@ -22,3 +22,6 @@ orbax-checkpoint==0.12.9
 # TensorBoard event writing, viewing, and test readback
 tensorboardX==2.6.5
 tensorboard==2.21.0
+
+# Training progress
+tqdm==4.70.1
