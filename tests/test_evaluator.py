@@ -9,7 +9,7 @@ import numpy as np
 from Go.env import ScorchEnv
 from MCTX.mctx import SearchConfig
 from Scorch.scorch import Scorch
-from Trainer.scorch_trainer import Evaluation, ScorchEvaluator
+from Trainer import Evaluation, EvaluationConfig, ScorchEvaluator
 
 
 class EvaluationTests(unittest.TestCase):
@@ -43,7 +43,7 @@ class ScorchEvaluatorTests(unittest.TestCase):
         cls.placing = jax.tree_util.tree_map(jnp.zeros_like, cls.agent.params)
         cls.placing["policy_head"]["policy_placement_logits_mlp"]["bias"] = jnp.array([3.0])
         cls.placing["policy_head"]["policy_passing_logits_mlp"]["bias"] = jnp.array([-3.0])
-        cls.evaluator = ScorchEvaluator()
+        cls.evaluator = ScorchEvaluator(cls.agent)
 
     def test_each_game_uses_its_own_players_network(self):
         # Seed 91 gives different current player IDs in these two games.
@@ -61,23 +61,23 @@ class ScorchEvaluatorTests(unittest.TestCase):
 
     def test_paired_games_balance_candidate_colors(self):
         result = self.evaluator.evaluate(
-            self.passing, self.passing, self.agent.mctx, jax.random.PRNGKey(7),
-            self.config, 0.0, num_steps=2, batch_size=4, seed=91,
+            self.passing, self.passing, jax.random.PRNGKey(7),
+            config=EvaluationConfig(num_steps=2, num_games=4, seed=91, search_config=self.config),
         )
         self.assertEqual(result, Evaluation(2, 2, 0, 0))
 
     def test_move_limit_reports_unfinished_games(self):
         result = self.evaluator.evaluate(
-            self.passing, self.passing, self.agent.mctx, jax.random.PRNGKey(7),
-            self.config, 0.0, num_steps=1, batch_size=4, seed=91,
+            self.passing, self.passing, jax.random.PRNGKey(7),
+            config=EvaluationConfig(num_steps=1, num_games=4, seed=91, search_config=self.config),
         )
         self.assertEqual(result, Evaluation(0, 0, 0, 4))
 
     def test_evaluation_preserves_live_environment_and_agent(self):
         key = self.agent.prng_key
         self.evaluator.evaluate(
-            self.passing, self.passing, self.agent.mctx, jax.random.PRNGKey(7),
-            self.config, 0.0, num_steps=2, batch_size=4, seed=91,
+            self.passing, self.passing, jax.random.PRNGKey(7),
+            config=EvaluationConfig(num_steps=2, num_games=4, seed=91, search_config=self.config),
         )
         for actual, expected in zip(jax.tree_util.tree_leaves(self.env.state),
                                     jax.tree_util.tree_leaves(self.state)):
@@ -87,10 +87,10 @@ class ScorchEvaluatorTests(unittest.TestCase):
 
     def test_invalid_evaluation_batch_sizes_are_rejected(self):
         for size in (0, 1, 3):
-            with self.subTest(batch_size=size), self.assertRaises(ValueError):
+            with self.subTest(num_games=size), self.assertRaises(ValueError):
                 self.evaluator.evaluate(
-                    self.passing, self.passing, self.agent.mctx, jax.random.PRNGKey(7),
-                    self.config, 0.0, num_steps=2, batch_size=size, seed=91,
+                    self.passing, self.passing, jax.random.PRNGKey(7),
+                    config=EvaluationConfig(num_steps=2, num_games=size, seed=91, search_config=self.config),
                 )
 
 

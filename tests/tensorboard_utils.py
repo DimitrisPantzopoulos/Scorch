@@ -1,34 +1,32 @@
-"""Keep real TensorBoard writers and their files inside temporary test folders."""
+"""Keep real TensorBoard loggers and their files inside temporary test folders."""
 
 from pathlib import Path
 import tempfile
 from unittest.mock import patch
 
-from tensorboardX import SummaryWriter
+from Trainer.tensorboard_logger import TensorBoardLogger
 
 
 def isolate_tensorboard_writers(test_class):
     directory = tempfile.TemporaryDirectory(prefix="scorch-tensorboard-")
     root = Path(directory.name)
-    writers = []
+    loggers = []
     test_class.addClassCleanup(directory.cleanup)
 
-    def create_writer(logdir=None, **kwargs):
-        requested = kwargs.pop("log_dir", logdir)
-        # Preserve the requested folder name so invalid run names still fail.
-        destination = root / Path(requested).name if requested is not None else root / "default"
-        writer = SummaryWriter(log_dir=str(destination), **kwargs)
-        writers.append(writer)
-        return writer
+    def create_logger(log_dir=None, *, run_name=None):
+        # Keep the real timestamp/naming behavior while redirecting defaults.
+        logger = TensorBoardLogger(log_dir=log_dir, run_name=run_name, base_dir=root)
+        loggers.append(logger)
+        return logger
 
-    patcher = patch("Trainer.scorch_trainer.SummaryWriter", side_effect=create_writer)
+    patcher = patch("Trainer.scorch_trainer.TensorBoardLogger", side_effect=create_logger)
     patcher.start()
     test_class.addClassCleanup(patcher.stop)
 
-    def close_writers():
-        for writer in writers:
-            writer.close()
+    def close_loggers():
+        for logger in loggers:
+            logger.close()
 
     # LIFO cleanup closes files before deleting their directories on Windows.
-    test_class.addClassCleanup(close_writers)
+    test_class.addClassCleanup(close_loggers)
     return root
