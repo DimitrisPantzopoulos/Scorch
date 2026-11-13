@@ -6,6 +6,7 @@ and binds collection, learning, evaluation, logging, and checkpoints.
 
 ```python
 from MCTX.mctx import SearchConfig
+from Scorch import NetworkConfig
 from Trainer import (
     EvaluationConfig,
     ScorchTrainer,
@@ -17,6 +18,13 @@ from Trainer import (
 with ScorchTrainer.create(
         num_envs          = 256,
         seed              = 42,
+        network_config    = NetworkConfig(
+                                d_model          = 128,
+                                num_heads        = 4,
+                                num_blocks       = 4,
+                                mlp_ratio        = 4,
+                                value_hidden_dim = 1,
+                            ),
         search_config     = SearchConfig(num_simulations=32),
         training_config   = TrainingConfig(epochs=4, minibatch_size=128),
         self_play_config  = SelfPlayConfig(num_steps=256, temperature=1.0),
@@ -37,6 +45,12 @@ components when constructing the trainer; `train()` only needs an iteration
 count. Passing `evaluation_config=None` enables training without evaluation or
 promotion gating.
 
+`network_config` controls architecture independently from MCTX search settings
+and optimizer settings. It reaches the agent, learner, self-play, and evaluator
+through the same configured network. Omit it to retain the original model.
+See `Scorch/README.md` for all network settings, standalone use, validation,
+and parameter-sweep examples using `dataclasses.replace`.
+
 Training reports contain iterations completed in that call, promotions,
 the accepted optimizer step, the next iteration number, the latest evaluation
 performed in the call, and the latest automatic checkpoint path.
@@ -51,11 +65,12 @@ report = trainer.train(iterations=10)
 ```
 
 Restoration includes model parameters, optimizer state, counters, and trainer,
-agent, and environment RNG keys. Use the same model, training, search, and
+agent, and environment RNG keys. Use the same network architecture, training, search, and
 collection configuration when resuming. Existing checkpoint payloads remain
 compatible; older checkpoints without an iteration counter infer it from the
 episode counter and current environment batch size. Live boards are not saved;
 collection resets games using the restored environment RNG.
+Architecture configs are supplied to the factory and are not stored in checkpoints.
 
 Automatic checkpoints use unique `iteration_000001` folders. Existing checkpoint
 destinations are never overwritten. The context manager closes TensorBoard

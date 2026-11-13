@@ -10,6 +10,7 @@ from flax.training.train_state import TrainState
 
 from Go.env import ScorchEnv
 from MCTX.mctx import SearchConfig
+from Scorch.config import NetworkConfig
 from Scorch.scorch import Scorch
 from .checkpoint_manager import Checkpoint, CheckpointManager
 from .config import EvaluationConfig, SelfPlayConfig, TrainingConfig
@@ -62,6 +63,7 @@ class ScorchTrainer:
             *,
             num_envs          : int                     = 256,
             seed              : int                     = 42,
+            network_config    : NetworkConfig           = NetworkConfig(),
             search_config     : SearchConfig            = SearchConfig(),
             training_config   : TrainingConfig          = TrainingConfig(),
             self_play_config  : SelfPlayConfig          = SelfPlayConfig(),
@@ -77,7 +79,12 @@ class ScorchTrainer:
         env_seed   : int = int(jax.random.bits(env_key, dtype=jnp.uint32))
         model_seed : int = int(jax.random.bits(model_key, dtype=jnp.uint32))
         env        : ScorchEnv = ScorchEnv(batch_size=num_envs, seed=env_seed)
-        scorch     : Scorch = Scorch(search_config, env, seed=model_seed)
+        scorch     : Scorch = Scorch(
+            search_config  = search_config,
+            env            = env,
+            seed           = model_seed,
+            network_config = network_config,
+        )
 
         trainer : Self = cls(
             scorch,

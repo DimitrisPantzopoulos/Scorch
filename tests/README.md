@@ -17,6 +17,7 @@ Run individual areas with:
 
 ```powershell
 python -m unittest tests.test_env tests.test_model -v
+python -m unittest tests.test_network_config -v
 python -m unittest tests.test_mctx tests.test_scorch -v
 python -m unittest tests.test_training -v
 python -m unittest tests.test_evaluator tests.test_final_training -v
@@ -30,6 +31,10 @@ python -m unittest tests.test_public_api -v
   reproducibility, and preservation of unfinished games.
 - Neural network: token ordering, attention, residuals, heads, JIT agreement,
   batch independence, legal-action masking, and useful gradients.
+- Network configuration: immutable validated settings, custom widths/heads/blocks,
+  MLP and value-head widths, embedding initialization, inferred token dimensions,
+  zero-block ablations, custom gradients, public import orders, real configured
+  search/evaluation/training, and exact custom-model checkpoint resumption.
 - Agent/search: legal moves, normalized targets, reward perspective,
   terminal handling, configuration forwarding, RNG advancement, and state
   preservation.

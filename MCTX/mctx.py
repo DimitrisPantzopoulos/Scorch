@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 
@@ -11,8 +13,10 @@ import functools
 
 from dataclasses import dataclass
 from Go.env import ScorchEnv
-from Scorch.scorch_nn import ScorchNeuralNetwork
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
+
+if TYPE_CHECKING:
+    from Scorch.scorch_nn import ScorchNeuralNetwork
 
 @dataclass(frozen=True)
 class SearchConfig:
