@@ -1,0 +1,24 @@
+# Python 3.12 or newer.
+# Versions match the environment used for the 157 passing project tests.
+# Local/CPU: python -m pip install -r requirements.txt
+# Colab TPU: %pip install -r requirements.txt "jax[tpu]==0.12.0.1"
+# Restart the notebook runtime after installation, before importing JAX.
+
+# Numerical computing and neural network
+jax==0.12.0.1
+jaxlib==0.12.0.1
+numpy==2.5.4
+flax==0.12.12
+
+# Go environment and Monte Carlo tree search
+pgx==2.6.0
+mctx==0.0.71
+chex==0.1.92
+
+# Optimization and checkpoints
+optax==0.2.8
+orbax-checkpoint==0.12.9
+
+# TensorBoard event writing, viewing, and test readback
+tensorboardX==2.6.5
+tensorboard==2.21.0
